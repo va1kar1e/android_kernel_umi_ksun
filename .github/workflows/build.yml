@@ -118,14 +118,28 @@ jobs:
           done
           grep -E '^CONFIG_KSU|KSU_MANUAL_HOOK' "$OUT/.config"
 
+      # KernelSU-Next's Kbuild edits fs/namespace.c, fs/internal.h and include/linux/seccomp.h with
+      # $(shell sed ...) while make parses drivers/kernelsu/Kbuild. A normal build reaches drivers/
+      # after fs/ and kernel/ are already compiled, so those objects would miss the edits (undefined
+      # path_umount, and struct seccomp layout mismatch). Building the KernelSU dir first applies them
+      # up front; the full build below then rebuilds whatever depends on the edited files.
+      - name: Pre-apply KernelSU-Next source backports
+        working-directory: kernel
+        run: |
+          make -j"$(nproc)" $MAKE_FLAGS drivers/kernelsu/ 2>&1 | tee "$OUT/prebuild.log"; test "${PIPESTATUS[0]}" -eq 0
+          grep -q '^int path_umount' fs/namespace.c || { echo "::error::path_umount not added to fs/namespace.c"; exit 1; }
+          grep -q '^int path_umount' fs/internal.h || { echo "::error::path_umount not declared in fs/internal.h"; exit 1; }
+          grep -q 'atomic_t filter_count;' include/linux/seccomp.h || { echo "::error::filter_count missing from seccomp.h"; exit 1; }
+          git status --short fs include | head
+
       - name: Build Image
         working-directory: kernel
         run: make -k -j"$(nproc)" $MAKE_FLAGS Image 2>&1 | tee "$OUT/build.log"; test "${PIPESTATUS[0]}" -eq 0
 
       - name: Check KernelSU-Next is in the Image
         run: |
-          grep -E -- '-- KernelSU-Next' "$OUT/build.log" || true
-          grep -q 'Hook mode: Syscall table patching' "$OUT/build.log" \
+          grep -hE -- '-- KernelSU-Next' "$OUT/prebuild.log" "$OUT/build.log" | sort -u || true
+          grep -q 'Hook mode: Syscall table patching' "$OUT/prebuild.log" "$OUT/build.log" \
             || { echo "::error::KernelSU-Next hook mode line not found in build log"; exit 1; }
           test -s "$OUT/arch/arm64/boot/Image"
           strings "$OUT/arch/arm64/boot/Image" | grep -m1 'Linux version'
@@ -136,7 +150,7 @@ jobs:
           rm -rf ak3/.git ak3/.github ak3/README.md ak3/modules ak3/patch ak3/ramdisk
           cp anykernel.sh ak3/anykernel.sh
           cp "$OUT/arch/arm64/boot/Image" ak3/Image
-          KSU_VER=$(grep -oE 'KernelSU-Next version: [0-9]+' "$OUT/build.log" | head -1 | grep -oE '[0-9]+$' || echo unknown)
+          KSU_VER=$(grep -hoE 'KernelSU-Next version: [0-9]+' "$OUT/prebuild.log" "$OUT/build.log" | head -1 | grep -oE '[0-9]+$' || echo unknown)
           ZIP="umi-${KERNEL_BRANCH}-KSUN-${KSU_VER}-$(date -u +%Y%m%d).zip"
           (cd ak3 && zip -r9 "../$ZIP" . -x '.*')
           sha256sum "$ZIP" | tee "$ZIP.sha256"
@@ -158,6 +172,7 @@ jobs:
           name: build-log
           path: |
             out/.config
+            out/prebuild.log
             out/build.log
           include-hidden-files: true
           if-no-files-found: ignore

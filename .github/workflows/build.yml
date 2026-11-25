@@ -78,6 +78,24 @@ jobs:
           curl -fLSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSU_REF}/kernel/setup.sh" | bash -s "$KSU_REF"
           git -C KernelSU-Next log -1 --format='KernelSU-Next %H (%cd)'
 
+      # KernelSU-Next legacy assumes kernels < 5.8 lack copy_to_kernel_nofault and #defines it to
+      # probe_kernel_write; LineageOS 4.19 already backports the real function, so the macro
+      # rewrites the declaration in <linux/uaccess.h> and breaks the build.
+      - name: Patch KernelSU-Next for backported nofault API
+        working-directory: kernel
+        run: |
+          grep -q 'copy_to_kernel_nofault' include/linux/uaccess.h || { echo "kernel has no copy_to_kernel_nofault, nothing to patch"; exit 0; }
+          python3 - <<'EOF'
+          import re
+          p = "KernelSU-Next/kernel/hook/patch_memory.c"
+          s = open(p).read()
+          n = re.sub(r'#if LINUX_VERSION_CODE < KERNEL_VERSION\(5, 8, 0\)\n#define copy_to_kernel_nofault\([^\n]*\\\n[^\n]*\n#endif\n', '', s, count=1)
+          assert n != s, "copy_to_kernel_nofault macro block not found; upstream changed, review the patch"
+          open(p, "w").write(n)
+          print("removed copy_to_kernel_nofault compat macro")
+          EOF
+          ! grep -n 'define copy_to_kernel_nofault' KernelSU-Next/kernel/hook/patch_memory.c
+
       - name: Generate .config (same fragment order as LineageOS umi)
         working-directory: kernel
         run: |
@@ -102,7 +120,7 @@ jobs:
 
       - name: Build Image
         working-directory: kernel
-        run: make -j"$(nproc)" $MAKE_FLAGS Image 2>&1 | tee "$OUT/build.log"; test "${PIPESTATUS[0]}" -eq 0
+        run: make -k -j"$(nproc)" $MAKE_FLAGS Image 2>&1 | tee "$OUT/build.log"; test "${PIPESTATUS[0]}" -eq 0
 
       - name: Check KernelSU-Next is in the Image
         run: |

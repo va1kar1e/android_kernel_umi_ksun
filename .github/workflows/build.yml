@@ -3,13 +3,13 @@ name: Build umi kernel (KernelSU-Next)
 on:
   workflow_dispatch:
     inputs:
-      kernel_branch:
-        description: LineageOS kernel branch (must match the LineageOS version on the phone)
-        default: lineage-23.2
+      kernel_ref:
+        description: LineageOS kernel commit SHA (lineage-23.2 head when pinned; a branch name also works)
+        default: 71b13e62f057a649b77fe4062feb73ee72ad609c
         required: true
       ksu_ref:
-        description: KernelSU-Next branch or tag (non-GKI 4.19 needs the legacy line)
-        default: legacy
+        description: KernelSU-Next commit SHA (legacy branch, reviewed at this commit; a branch or tag also works)
+        default: e5f5ec998de88b9fc43c62cff8f7ae12d3f4800a
         required: true
       clang_version:
         description: AOSP prebuilt clang directory name
@@ -25,8 +25,10 @@ jobs:
     timeout-minutes: 180
     env:
       KERNEL_REPO: https://github.com/LineageOS/android_kernel_xiaomi_sm8250.git
-      KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+      KERNEL_REF: ${{ inputs.kernel_ref }}
       KSU_REF: ${{ inputs.ksu_ref }}
+      AK3_REF: 41f04bdb4ee30a44e429c2c1131d5e8bb32b15f1
+      LOS_VERSION: lineage-23.2
       CLANG_VERSION: ${{ inputs.clang_version }}
       OUT: ${{ github.workspace }}/out
 
@@ -68,7 +70,7 @@ jobs:
           "$CLANG_BIN/ld.lld" --version
 
       - name: Clone LineageOS kernel
-        run: git clone --depth 1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
+        run: bash scripts/fetch_pinned.sh "$KERNEL_REPO" "$KERNEL_REF" kernel
 
       - name: Integrate KernelSU-Next
         working-directory: kernel
@@ -77,6 +79,10 @@ jobs:
           git config --global user.email ci@localhost
           curl -fLSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSU_REF}/kernel/setup.sh" | bash -s "$KSU_REF"
           git -C KernelSU-Next log -1 --format='KernelSU-Next %H (%cd)'
+          got=$(git -C KernelSU-Next rev-parse HEAD)
+          if [[ "$KSU_REF" =~ ^[0-9a-f]{40}$ && "$got" != "$KSU_REF" ]]; then
+            echo "::error::KernelSU-Next resolved to $got, expected pinned $KSU_REF"; exit 1
+          fi
 
       # KernelSU-Next legacy assumes kernels < 5.8 lack copy_to_kernel_nofault and #defines it to
       # probe_kernel_write; LineageOS 4.19 already backports the real function, so the macro
@@ -139,6 +145,21 @@ jobs:
         working-directory: kernel
         run: make -k -j"$(nproc)" $MAKE_FLAGS Image 2>&1 | tee "$OUT/build.log"; test "${PIPESTATUS[0]}" -eq 0
 
+      - name: Record pinned commits and kernel source changes
+        if: always()
+        working-directory: kernel
+        run: |
+          {
+            echo "kernel      $(git rev-parse HEAD)"
+            echo "KernelSU    $(git -C KernelSU-Next rev-parse HEAD)"
+            echo "AnyKernel3  $AK3_REF"
+            echo "clang       $CLANG_VERSION"
+          } | tee "$OUT/pins.txt" || true
+          git diff > "$OUT/kernel-source.diff" || true
+          git -C KernelSU-Next diff > "$OUT/ksun-local.diff" || true
+          git status --short | tee "$OUT/kernel-status.txt" || true
+          git diff --stat | tail -30 || true
+
       - name: Check KernelSU-Next is in the Image
         run: |
           grep -hE -- '-- KernelSU-Next' "$OUT/prebuild.log" "$OUT/build.log" | sort -u || true
@@ -149,12 +170,12 @@ jobs:
 
       - name: Package AnyKernel3 zip
         run: |
-          git clone --depth 1 https://github.com/osm0sis/AnyKernel3.git ak3
+          bash scripts/fetch_pinned.sh https://github.com/osm0sis/AnyKernel3.git "$AK3_REF" ak3
           rm -rf ak3/.git ak3/.github ak3/README.md ak3/modules ak3/patch ak3/ramdisk
           cp anykernel.sh ak3/anykernel.sh
           cp "$OUT/arch/arm64/boot/Image" ak3/Image
           KSU_VER=$(grep -hoE 'KernelSU-Next version: [0-9]+' "$OUT/prebuild.log" "$OUT/build.log" | head -1 | grep -oE '[0-9]+$' || echo unknown)
-          ZIP="umi-${KERNEL_BRANCH}-KSUN-${KSU_VER}-$(date -u +%Y%m%d).zip"
+          ZIP="umi-${LOS_VERSION}-KSUN-${KSU_VER}-$(date -u +%Y%m%d).zip"
           (cd ak3 && zip -r9 "../$ZIP" . -x '.*')
           sha256sum "$ZIP" | tee "$ZIP.sha256"
           echo "ZIP=$ZIP" >> "$GITHUB_ENV"
@@ -177,5 +198,9 @@ jobs:
             out/.config
             out/prebuild.log
             out/build.log
+            out/pins.txt
+            out/kernel-source.diff
+            out/ksun-local.diff
+            out/kernel-status.txt
           include-hidden-files: true
           if-no-files-found: ignore

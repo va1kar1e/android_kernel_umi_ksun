@@ -1,0 +1,127 @@
+name: Build umi kernel (KernelSU-Next)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: LineageOS kernel branch (must match the LineageOS version on the phone)
+        default: lineage-23.2
+        required: true
+      ksu_ref:
+        description: KernelSU-Next branch or tag (non-GKI 4.19 needs the legacy line)
+        default: legacy
+        required: true
+      clang_version:
+        description: AOSP prebuilt clang directory name
+        default: clang-r547379
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      KERNEL_REPO: https://github.com/LineageOS/android_kernel_xiaomi_sm8250.git
+      KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+      KSU_REF: ${{ inputs.ksu_ref }}
+      CLANG_VERSION: ${{ inputs.clang_version }}
+      OUT: ${{ github.workspace }}/out
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev cpio zip python3 make git device-tree-compiler
+
+      - name: Download AOSP clang
+        run: |
+          mkdir -p "$HOME/clang"
+          curl -fL --retry 3 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz" \
+            | tar -xz -C "$HOME/clang"
+          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
+          "$HOME/clang/bin/clang" --version
+
+      - name: Clone LineageOS kernel
+        run: git clone --depth 1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
+
+      - name: Integrate KernelSU-Next
+        working-directory: kernel
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@localhost
+          curl -fLSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSU_REF}/kernel/setup.sh" | bash -s "$KSU_REF"
+          git -C KernelSU-Next log -1 --format='KernelSU-Next %H (%cd)'
+
+      - name: Generate .config (same fragment order as LineageOS umi)
+        working-directory: kernel
+        run: |
+          MAKE_FLAGS="ARCH=arm64 O=$OUT LLVM=1 LLVM_IAS=1 CC=clang LD=ld.lld AR=llvm-ar \
+            HOSTCC=clang HOSTCXX=clang++ HOSTLD=ld.lld HOSTAR=llvm-ar"
+          echo "MAKE_FLAGS=$MAKE_FLAGS" >> "$GITHUB_ENV"
+          mkdir -p "$OUT"
+          cp arch/arm64/configs/vendor/kona-perf_defconfig "$OUT/.config"
+          make $MAKE_FLAGS olddefconfig
+          for frag in \
+            arch/arm64/configs/vendor/debugfs.config \
+            arch/arm64/configs/vendor/xiaomi/sm8250-common.config \
+            arch/arm64/configs/vendor/xiaomi/umi.config \
+            "$GITHUB_WORKSPACE/ksu.config"; do
+            scripts/kconfig/merge_config.sh -m -O "$OUT" "$OUT/.config" "$frag"
+            make $MAKE_FLAGS olddefconfig
+          done
+          for opt in CONFIG_KSU=y CONFIG_KSU_SYSCALL_TABLE_HOOK=y CONFIG_KALLSYMS_ALL=y CONFIG_MACH_XIAOMI_UMI=y; do
+            grep -qx "$opt" "$OUT/.config" || { echo "::error::$opt missing from final .config"; exit 1; }
+          done
+          grep -E '^CONFIG_KSU|KSU_MANUAL_HOOK' "$OUT/.config"
+
+      - name: Build Image
+        working-directory: kernel
+        run: make -j"$(nproc)" $MAKE_FLAGS Image 2>&1 | tee "$OUT/build.log"; test "${PIPESTATUS[0]}" -eq 0
+
+      - name: Check KernelSU-Next is in the Image
+        run: |
+          grep -E -- '-- KernelSU-Next' "$OUT/build.log" || true
+          grep -q 'Hook mode: Syscall table patching' "$OUT/build.log" \
+            || { echo "::error::KernelSU-Next hook mode line not found in build log"; exit 1; }
+          test -s "$OUT/arch/arm64/boot/Image"
+          strings "$OUT/arch/arm64/boot/Image" | grep -m1 'Linux version'
+
+      - name: Package AnyKernel3 zip
+        run: |
+          git clone --depth 1 https://github.com/osm0sis/AnyKernel3.git ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md ak3/modules ak3/patch ak3/ramdisk
+          cp anykernel.sh ak3/anykernel.sh
+          cp "$OUT/arch/arm64/boot/Image" ak3/Image
+          KSU_VER=$(grep -oE 'KernelSU-Next version: [0-9]+' "$OUT/build.log" | head -1 | grep -oE '[0-9]+$' || echo unknown)
+          ZIP="umi-${KERNEL_BRANCH}-KSUN-${KSU_VER}-$(date -u +%Y%m%d).zip"
+          (cd ak3 && zip -r9 "../$ZIP" . -x '.*')
+          sha256sum "$ZIP" | tee "$ZIP.sha256"
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP }}
+          path: |
+            ${{ env.ZIP }}
+            ${{ env.ZIP }}.sha256
+          if-no-files-found: error
+
+      - name: Upload config and build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            out/.config
+            out/build.log
+          include-hidden-files: true
+          if-no-files-found: ignore

@@ -126,7 +126,10 @@ jobs:
       - name: Pre-apply KernelSU-Next source backports
         working-directory: kernel
         run: |
-          make -j"$(nproc)" $MAKE_FLAGS drivers/kernelsu/ 2>&1 | tee "$OUT/prebuild.log"; test "${PIPESTATUS[0]}" -eq 0
+          # KernelSU includes SELinux's generated flask.h, which a full build creates before drivers/
+          make -j"$(nproc)" $MAKE_FLAGS security/selinux/ 2>&1 | tee "$OUT/prebuild.log"; test "${PIPESTATUS[0]}" -eq 0
+          test -f "$OUT/security/selinux/flask.h" || { echo "::error::flask.h was not generated"; exit 1; }
+          make -j"$(nproc)" $MAKE_FLAGS drivers/kernelsu/ 2>&1 | tee -a "$OUT/prebuild.log"; test "${PIPESTATUS[0]}" -eq 0
           grep -q '^int path_umount' fs/namespace.c || { echo "::error::path_umount not added to fs/namespace.c"; exit 1; }
           grep -q '^int path_umount' fs/internal.h || { echo "::error::path_umount not declared in fs/internal.h"; exit 1; }
           grep -q 'atomic_t filter_count;' include/linux/seccomp.h || { echo "::error::filter_count missing from seccomp.h"; exit 1; }
